@@ -4,24 +4,28 @@
 # for **Ada Lovelace** GPUs (RTX 4060 Ti / 4070 / 4080 / 4090, L4 / L40 / L40S,
 # RTX 4000/4500/5000/6000 Ada).
 #
-# The official ghcr.io/ggml-org/llama.cpp:server-cuda image dropped sm_89
-# support around mid-2026 (only sm_50/61/70/75/80 + compute_80 PTX in
-# current builds). This image recompiles from upstream master with the
-# sm_89 arch explicitly set, so it actually works on RTX 40-series cards.
+# Why: the official ghcr.io/ggml-org/llama.cpp:server-cuda image dropped sm_89
+# from its default CMAKE_CUDA_ARCHITECTURES around mid-2026. Current official
+# builds (b4721+) only ship kernels for sm_50/61/70/75/80 with a compute_80 PTX
+# fallback, so loading any GPU model on an RTX 40-series card segfaults right
+# after "print_info: file size".
 #
-# Built automatically by .github/workflows/build-sm89.yml and pushed to:
-#   ghcr.io/Chyrain/llama-cpp-sm89-docker:sm89-latest
+# This image recompiles upstream llama.cpp master with sm_89 forced on.
 #
-# Build is rebuilt weekly (Monday 06:17 UTC) and on every push to this
-# Dockerfile / the workflow file.
+# Structure mirrors ggml-org/llama.cpp/.devops/cuda.Dockerfile (upstream
+# Apache-2.0), with three changes:
+#   1. CUDA_DOCKER_ARCH defaults to 89 (upstream: "default" = all supported)
+#   2. llm source ref is configurable via LLAMA_REF
+#   3. server-only runtime stage (no python conversion tooling)
 
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
 ARG CUDA_DOCKER_ARCH=89
 ARG LLAMA_REF=master
+ARG GCC_VERSION=14
 
 # ============================================================
-# Stage 1: clone llama.cpp source (shared by web + build stages)
+# Stage 1 — source checkout (shared by web + build stages)
 # ============================================================
 FROM alpine:3.20 AS src
 ARG LLAMA_REF
@@ -30,19 +34,21 @@ RUN apk add --no-cache git ca-certificates && \
         https://github.com/ggml-org/llama.cpp.git /src
 
 # ============================================================
-# Stage 2: build the web UI assets (server's web/index.html etc.)
+# Stage 2 — build the bundled web UI
 # ============================================================
 FROM docker.io/node:24 AS web
-COPY --from=src /src /src
-WORKDIR /src/tools/ui
-RUN npm ci && \
-    LLAMA_BUILD_NUMBER=custom-sm89 npm run build
+WORKDIR /ui
+COPY --from=src /src/tools/ui/package.json \
+                /src/tools/ui/package-lock.json ./
+RUN npm ci
+COPY --from=src /src/tools/ui/ ./
+RUN LLAMA_BUILD_NUMBER=custom-sm89 npm run build
 
 # ============================================================
-# Stage 3: compile llama.cpp with CUDA sm_89
+# Stage 3 — compile llama.cpp for CUDA sm_89
 # ============================================================
 FROM docker.io/nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS build
-ARG GCC_VERSION=14
+ARG GCC_VERSION
 ARG CUDA_DOCKER_ARCH
 
 RUN apt-get update && \
@@ -57,10 +63,11 @@ ENV CC=gcc-${GCC_VERSION} \
     CUDAHOSTCXX=g++-${GCC_VERSION}
 
 WORKDIR /app
-COPY --from=src /src /app
-COPY --from=web /src/tools/ui/dist /app/tools/ui/dist
+COPY --from=src /src .
+COPY --from=web /ui/dist tools/ui/dist
 
-# The actual sm_89 compile:
+# The actual sm_89 compile. CUDA_DOCKER_ARCH=89 expands to
+# -DCMAKE_CUDA_ARCHITECTURES=89 → nvcc emits real (sm_89) + compute_89 PTX.
 RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
       export CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_DOCKER_ARCH}"; \
     fi && \
@@ -72,10 +79,18 @@ RUN if [ "${CUDA_DOCKER_ARCH}" != "default" ]; then \
       -DLLAMA_BUILD_TESTS=OFF \
       ${CMAKE_ARGS} \
       -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined . && \
-    cmake --build build --config Release -j$(nproc)
+    cmake --build build --config Release -j"$(nproc)"
+
+# Stage every shared object into one dir, preserving symlinks and
+# the per-CPU-variant backends that -DGGML_BACKEND_DL=ON loads at runtime.
+RUN mkdir -p /staging/lib && \
+    find build -name "*.so*" -exec cp -P {} /staging/lib \; && \
+    mkdir -p /staging/bin && \
+    cp build/bin/llama-server build/bin/llama-cli build/bin/llama-gguf-hash /staging/bin/ && \
+    ls -la /staging/lib | head -30
 
 # ============================================================
-# Stage 4: minimal runtime — server + libs only
+# Stage 4 — runtime (server only, no python tooling)
 # ============================================================
 FROM docker.io/nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS server
 
@@ -84,19 +99,14 @@ RUN apt-get update && \
         libgomp1 curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-ENV LLAMA_ARG_HOST=0.0.0.0 \
-    LLAMA_ARG_PORT=8000
-
-# Copy binary + dynamic libs from build stage
-COPY --from=build /app/build/bin/llama-server  /app/llama-server
-COPY --from=build /app/build/bin/llama-cli     /app/llama-cli
-COPY --from=build /app/build/bin/llama-gguf-hash /app/llama-gguf-hash
-COPY --from=build /app/build/libggml.so        /app/libggml.so
-COPY --from=build /app/build/libggml-base.so   /app/libggml-base.so
-COPY --from=build /app/build/libggml-cpu.so    /app/libggml-cpu.so
-COPY --from=build /app/build/libggml-cuda.so   /app/libggml-cuda.so
+# Whole lib dir in one COPY so symlinks + CPU variants survive.
+COPY --from=build /staging/lib /app/
+COPY --from=build /staging/bin /app/
 
 WORKDIR /app
+
+ENV LLAMA_ARG_HOST=0.0.0.0 \
+    LLAMA_ARG_PORT=8080
 
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
