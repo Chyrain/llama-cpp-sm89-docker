@@ -1,7 +1,7 @@
 name: build-sm89
 
 # Builds llama.cpp server-cuda Docker image targeting sm_89 (Ada Lovelace,
-# RTX 40-series) and pushes to ghcr.io/Chyrain/llama-cpp-sm89-docker.
+# RTX 40-series) and pushes to ghcr.io/<owner>/llama-cpp-sm89-docker.
 #
 # The official ghcr.io/ggml-org/llama.cpp:server-cuda image dropped sm_89
 # support around mid-2026 — see https://github.com/ggml-org/llama.cpp —
@@ -10,7 +10,7 @@ name: build-sm89
 # Triggers:
 #   - workflow_dispatch (manual): set "tag" input to override image tag
 #   - schedule (weekly): keeps the image current with upstream master
-#   - push to main: rebuild on workflow file change
+#   - push to main: rebuild on workflow/Dockerfile change
 #
 # Pushed tags:
 #   - sm89-latest   (always, latest master build)
@@ -31,11 +31,12 @@ on:
     - cron: "17 6 * * 1"  # 06:17 UTC every Monday
   push:
     branches: [main]
-    paths: [.github/workflows/build-sm89.yml, Dockerfile]
+    paths:
+      - ".github/workflows/build-sm89.yml"
+      - "Dockerfile"
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
@@ -46,6 +47,11 @@ jobs:
       packages: write
 
     steps:
+      # ghcr.io requires lowercase paths; github.repository preserves case.
+      - name: Normalize image name (lowercase)
+        id: img
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Free up disk (GH runners have ~30G free)
         run: |
           sudo rm -rf /opt/hostedtoolcache || true
@@ -67,16 +73,15 @@ jobs:
         run: |
           SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           RUN=${{ github.run_number }}
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            USER_TAG="${{ inputs.tag }}"
-          else
-            USER_TAG="latest"
+          IMG="${{ env.REGISTRY }}/${{ steps.img.outputs.name }}"
+          # lowercase the user-supplied tag too
+          USER_TAG=$(echo "${{ inputs.tag || 'latest' }}" | tr '[:upper:]' '[:lower:]')
+          TAGS="${IMG}:sm89-${USER_TAG}"
+          if [ "${USER_TAG}" = "latest" ]; then
+            TAGS="${TAGS},${IMG}:sm89-${RUN}-${SHA}"
           fi
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sm89-${USER_TAG}"
-          if [ "$USER_TAG" = "latest" ]; then
-            TAGS="$TAGS,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sm89-${RUN}-${SHA}"
-          fi
-          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tags: ${TAGS}"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -96,7 +101,13 @@ jobs:
 
       - name: Image summary
         run: |
-          echo "### Built image" >> "$GITHUB_STEP_SUMMARY"
-          echo "Tags: \`${{ steps.tags.outputs.tags }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source: ggml-org/llama.cpp@${{ inputs.llama_ref || 'master' }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "CUDA arch: sm_89 (Ada Lovelace)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Built image"
+            echo ""
+            echo '```'
+            echo "${{ steps.tags.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "- Source: \`ggml-org/llama.cpp@${{ inputs.llama_ref || 'master' }}\`"
+            echo "- CUDA arch: \`sm_89\` (Ada Lovelace)"
+          } >> "$GITHUB_STEP_SUMMARY"
