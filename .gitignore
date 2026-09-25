@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+*.swp
+*.swo
+*~
+
+# Secrets / env
+.env
+.env.local
+
+# Docker
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
