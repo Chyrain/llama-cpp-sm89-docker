@@ -47,6 +47,10 @@ jobs:
       packages: write
 
     steps:
+      # Build context must exist before buildx reads `file: Dockerfile`.
+      - name: Checkout
+        uses: actions/checkout@v4
+
       # ghcr.io requires lowercase paths; github.repository preserves case.
       - name: Normalize image name (lowercase)
         id: img
